@@ -1,0 +1,9 @@
+{
+  "id": "super-agent",
+  "channels": ["super-agent"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "name": "openclaw-super-agent",
+  "version": "0.1.0",
+  "description": "OpenClaw channel plugin — control OpenClaw Agent remotely from Super Agent Mobile App",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xhqzjgt/openclaw-xjbot.git"
+  },
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "super-agent",
+    "remote-control",
+    "mobile-agent",
+    "ai-agent"
+  ],
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "ws": ">=8.0.0"
+  }
+}
