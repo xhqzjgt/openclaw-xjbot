@@ -297,13 +297,13 @@ async function handleInboundExecute(
           bridge.sendAgentStream({
             session_id: sessionId,
             chunk_type: "text",
-            data: { content: combined },
+            content: combined,
           });
         } else if (text) {
           bridge.sendAgentStream({
             session_id: sessionId,
             chunk_type: "text",
-            data: { content: text },
+            content: text,
           });
         }
       },

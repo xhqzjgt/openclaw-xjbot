@@ -39,7 +39,10 @@ export interface AgentExecuteParams {
 export interface AgentStreamParams {
   session_id: string;
   chunk_type: "text" | "tool_call" | "tool_result" | "status" | "file";
-  data: Record<string, unknown>;
+  content?: string;
+  tool_name?: string;
+  tool_success?: boolean;
+  [key: string]: unknown;
 }
 
 export interface AgentCompleteParams {
