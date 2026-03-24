@@ -215,7 +215,7 @@ async function handleInboundExecute(
   const runtime = getSuperAgentRuntime();
   const channelRuntime = ctx.channelRuntime ?? runtime.channel;
   const cfg = ctx.cfg;
-  const sessionId = params.session_id;
+  const sessionId = params.session_id || crypto.randomUUID();
   const instruction = params.instruction;
 
   // Resolve agent route
