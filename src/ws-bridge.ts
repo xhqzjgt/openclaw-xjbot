@@ -28,6 +28,7 @@ export interface AgentExecuteParams {
   target_device_id: string;
   instruction: string;
   session_id: string;
+  request_id: string;
   attachments?: Array<{
     type: "image" | "audio" | "file";
     url: string;
@@ -36,22 +37,56 @@ export interface AgentExecuteParams {
   }>;
 }
 
+export interface TextChunkData {
+  content: string;
+}
+
+export interface ToolCallChunkData {
+  tool_name: string;
+  tool_input: Record<string, unknown>;
+}
+
+export interface ToolResultChunkData {
+  tool_name: string;
+  output: string;
+  success: boolean;
+}
+
+export interface StatusChunkData {
+  message: string;
+}
+
+export interface FileChunkData {
+  attachments: Array<{
+    file_id: string;
+    file_name: string;
+    file_type: "image" | "video" | "audio" | "file";
+    mime_type: string;
+    size_bytes: number;
+    url: string;
+  }>;
+}
+
+export type ChunkData = TextChunkData | ToolCallChunkData | ToolResultChunkData | StatusChunkData | FileChunkData;
+
 export interface AgentStreamParams {
   session_id: string;
+  request_id: string;
+  message_id: string;
   chunk_type: "text" | "tool_call" | "tool_result" | "status" | "file";
-  content?: string;
-  tool_name?: string;
-  tool_success?: boolean;
-  [key: string]: unknown;
+  created_at?: number;
+  data: ChunkData;
 }
 
 export interface AgentCompleteParams {
   session_id: string;
-  summary?: string;
+  request_id: string;
 }
 
 export interface AgentErrorParams {
   session_id: string;
+  request_id: string;
+  message_id: string;
   code: number;
   message: string;
 }

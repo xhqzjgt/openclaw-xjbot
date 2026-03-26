@@ -134,6 +134,8 @@ export const superAgentPlugin: ChannelPlugin<ResolvedSuperAgentAccount> = {
               log.error(`failed to handle agent.execute: ${err}`);
               bridge.sendAgentError({
                 session_id: params.session_id,
+                request_id: params.request_id || crypto.randomUUID(),
+                message_id: crypto.randomUUID(),
                 code: -1,
                 message: String(err),
               });
@@ -195,9 +197,15 @@ export const superAgentPlugin: ChannelPlugin<ResolvedSuperAgentAccount> = {
       if (!bridge) {
         throw new Error("super-agent bridge not connected");
       }
+      // Generate IDs for outbound messages (agent-initiated)
+      const requestId = crypto.randomUUID();
+      const messageId = crypto.randomUUID();
       bridge.sendAgentStream({
         session_id: to,
+        request_id: requestId,
+        message_id: messageId,
         chunk_type: "text",
+        created_at: Date.now(),
         data: { content: text },
       });
       return { channel: CHANNEL_ID };
@@ -216,6 +224,8 @@ async function handleInboundExecute(
   const channelRuntime = ctx.channelRuntime ?? runtime.channel;
   const cfg = ctx.cfg;
   const sessionId = params.session_id || crypto.randomUUID();
+  const requestId = params.request_id || crypto.randomUUID();
+  const messageId = crypto.randomUUID(); // Stable message ID for this response stream
   const instruction = params.instruction;
 
   // Resolve agent route
@@ -296,14 +306,20 @@ async function handleInboundExecute(
           const combined = text ? `${text}\n\n${mediaBlock}` : mediaBlock;
           bridge.sendAgentStream({
             session_id: sessionId,
+            request_id: requestId,
+            message_id: messageId,
             chunk_type: "text",
-            content: combined,
+            created_at: Date.now(),
+            data: { content: combined },
           });
         } else if (text) {
           bridge.sendAgentStream({
             session_id: sessionId,
+            request_id: requestId,
+            message_id: messageId,
             chunk_type: "text",
-            content: text,
+            created_at: Date.now(),
+            data: { content: text },
           });
         }
       },
@@ -311,6 +327,8 @@ async function handleInboundExecute(
         ctx.log?.error?.(`[${CHANNEL_ID}] dispatch error (${info.kind}): ${err}`);
         bridge.sendAgentError({
           session_id: sessionId,
+          request_id: requestId,
+          message_id: crypto.randomUUID(),
           code: -1,
           message: `Agent error: ${err}`,
         });
@@ -319,7 +337,7 @@ async function handleInboundExecute(
   });
 
   // Signal completion
-  bridge.sendAgentComplete({ session_id: sessionId });
+  bridge.sendAgentComplete({ session_id: sessionId, request_id: requestId });
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
