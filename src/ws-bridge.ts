@@ -123,6 +123,36 @@ export interface AgentInterveneParams {
   message?: string;
 }
 
+// ─── Voice Protocol Types ─────────────────────────────────────────────────────
+
+export type VoiceState = "listening" | "thinking" | "speaking" | "idle";
+
+export interface VoiceStartParams {
+  target_device_id: string;
+  session_id: string;
+}
+
+export interface VoicePcmParams {
+  target_device_id: string;
+  session_id: string;
+  data: string; // base64-encoded PCM
+}
+
+export interface VoiceEndParams {
+  target_device_id: string;
+  session_id: string;
+}
+
+export interface VoiceInterruptParams {
+  target_device_id: string;
+  session_id: string;
+}
+
+export interface VoiceStopParams {
+  target_device_id: string;
+  session_id: string;
+}
+
 // ─── Auth Types ──────────────────────────────────────────────────────────────
 
 interface AuthTokens {
@@ -149,6 +179,11 @@ export interface WsBridgeCallbacks {
   onIntervene?: (params: AgentInterveneParams) => void;
   onConnected?: () => void;
   onDisconnected?: () => void;
+  onVoiceStart?: (params: VoiceStartParams) => void;
+  onVoicePcm?: (params: VoicePcmParams) => void;
+  onVoiceEnd?: (params: VoiceEndParams) => void;
+  onVoiceInterrupt?: (params: VoiceInterruptParams) => void;
+  onVoiceStop?: (params: VoiceStopParams) => void;
 }
 
 export interface WsBridgeLogger {
@@ -234,6 +269,26 @@ export class WsBridge {
 
   sendClarifyRequest(params: AgentClarifyParams): void {
     this.sendNotification("agent.clarify", params);
+  }
+
+  sendVoiceStatus(sessionId: string, state: VoiceState): void {
+    this.sendNotification("voice.status", { session_id: sessionId, state });
+  }
+
+  sendVoiceTranscript(sessionId: string, text: string): void {
+    this.sendNotification("voice.transcript", { session_id: sessionId, text });
+  }
+
+  sendVoiceAudioChunk(sessionId: string, data: string): void {
+    this.sendNotification("voice.audio_chunk", { session_id: sessionId, data });
+  }
+
+  sendVoiceAudioEnd(sessionId: string): void {
+    this.sendNotification("voice.audio_end", { session_id: sessionId });
+  }
+
+  sendVoiceError(sessionId: string, message: string): void {
+    this.sendNotification("voice.error", { session_id: sessionId, message });
   }
 
   get connected(): boolean {
@@ -402,6 +457,21 @@ export class WsBridge {
         break;
       case "agent.intervene":
         this.callbacks.onIntervene?.(params as unknown as AgentInterveneParams);
+        break;
+      case "voice.start":
+        this.callbacks.onVoiceStart?.(params as unknown as VoiceStartParams);
+        break;
+      case "voice.pcm":
+        this.callbacks.onVoicePcm?.(params as unknown as VoicePcmParams);
+        break;
+      case "voice.end":
+        this.callbacks.onVoiceEnd?.(params as unknown as VoiceEndParams);
+        break;
+      case "voice.interrupt":
+        this.callbacks.onVoiceInterrupt?.(params as unknown as VoiceInterruptParams);
+        break;
+      case "voice.stop":
+        this.callbacks.onVoiceStop?.(params as unknown as VoiceStopParams);
         break;
       case "heartbeat.pong":
         this.log.debug?.("heartbeat pong received");

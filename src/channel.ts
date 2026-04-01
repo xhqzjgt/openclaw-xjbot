@@ -13,7 +13,14 @@ import {
   type AgentConfirmResponseParams,
   type AgentClarifyResponseParams,
   type AgentInterveneParams,
+  type VoiceStartParams,
+  type VoicePcmParams,
+  type VoiceEndParams,
+  type VoiceInterruptParams,
+  type VoiceStopParams,
 } from "./ws-bridge.js";
+import { VoiceSession } from "./voice-session.js";
+import { resolveVoiceConfig, buildTTSConfig, buildASRConfig } from "./voice-config.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -23,6 +30,7 @@ interface SuperAgentChannelConfig {
   password?: string;
   deviceId?: string;
   deviceName?: string;
+  voice?: Record<string, unknown>;
 }
 
 interface ResolvedSuperAgentAccount {
@@ -44,6 +52,10 @@ const pendingClarifies = new Map<string, (answer: string) => void>();
 // ─── Active Bridges ──────────────────────────────────────────────────────────
 
 const activeBridges = new Map<string, WsBridge>();
+
+// ─── Active Voice Sessions ────────────────────────────────────────────────────
+
+const activeSessions = new Map<string, VoiceSession>();
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -126,6 +138,12 @@ export const superAgentPlugin: ChannelPlugin<ResolvedSuperAgentAccount> = {
         debug: (msg: string) => ctx.log?.debug?.(`[${CHANNEL_ID}] ${msg}`),
       };
 
+      // Resolve voice config
+      const channelCfgRaw = resolveSuperAgentConfig(ctx.cfg) as unknown as Record<string, unknown>;
+      const voiceCfg = resolveVoiceConfig(channelCfgRaw);
+      const asrConfig = buildASRConfig(voiceCfg);
+      const ttsConfig = buildTTSConfig(voiceCfg);
+
       const bridge = new WsBridge(
         bridgeConfig,
         {
@@ -164,6 +182,36 @@ export const superAgentPlugin: ChannelPlugin<ResolvedSuperAgentAccount> = {
           },
           onConnected: () => log.info("connected to Super Agent Server"),
           onDisconnected: () => log.warn("disconnected from Super Agent Server"),
+          onVoiceStart: (params: VoiceStartParams) => {
+            handleVoiceStart(ctx, bridge, params, asrConfig, ttsConfig, log);
+          },
+          onVoicePcm: (params: VoicePcmParams) => {
+            const session = activeSessions.get(params.session_id);
+            if (session) {
+              session.handlePcm(Buffer.from(params.data, "base64"));
+            }
+          },
+          onVoiceEnd: (params: VoiceEndParams) => {
+            const session = activeSessions.get(params.session_id);
+            if (session) {
+              session.handleSpeechEnd().catch((err) => {
+                log.error(`voice.end error: ${err}`);
+              });
+            }
+          },
+          onVoiceInterrupt: (params: VoiceInterruptParams) => {
+            const session = activeSessions.get(params.session_id);
+            if (session) {
+              session.handleInterrupt();
+            }
+          },
+          onVoiceStop: (params: VoiceStopParams) => {
+            const session = activeSessions.get(params.session_id);
+            if (session) {
+              activeSessions.delete(params.session_id);
+              session.destroy().catch(() => {});
+            }
+          },
         },
         log,
       );
@@ -390,3 +438,138 @@ export function requestClarify(
 }
 
 export { activeBridges };
+
+// ─── Voice Session Handling ───────────────────────────────────────────────────
+
+function handleVoiceStart(
+  ctx: ChannelGatewayContext<ResolvedSuperAgentAccount>,
+  bridge: WsBridge,
+  params: VoiceStartParams,
+  asrConfig: ReturnType<typeof buildASRConfig>,
+  ttsConfig: ReturnType<typeof buildTTSConfig>,
+  log: { info: (s: string) => void; warn: (s: string) => void; error: (s: string) => void }
+): void {
+  const sessionId = params.session_id;
+
+  // Destroy any existing session for this sessionId
+  const existing = activeSessions.get(sessionId);
+  if (existing) {
+    existing.destroy().catch(() => {});
+    activeSessions.delete(sessionId);
+  }
+
+  if (!asrConfig || !ttsConfig) {
+    log.warn(`[voice] voice.start received but voice not configured (missing apiKey)`);
+    bridge.sendVoiceError(sessionId, "Voice not configured: missing apiKey in channels[super-agent].voice");
+    return;
+  }
+
+  const session = new VoiceSession(
+    sessionId,
+    {
+      asrConfig,
+      ttsConfig,
+      processText: async (text: string) => {
+        return handleVoiceText(ctx, text, sessionId, log);
+      },
+    },
+    {
+      onStatus: (state) => bridge.sendVoiceStatus(sessionId, state),
+      onTranscript: (text) => bridge.sendVoiceTranscript(sessionId, text),
+      onAudioChunk: (data) => bridge.sendVoiceAudioChunk(sessionId, data.toString("base64")),
+      onAudioEnd: () => bridge.sendVoiceAudioEnd(sessionId),
+      onError: (message) => bridge.sendVoiceError(sessionId, message),
+    },
+    log
+  );
+
+  activeSessions.set(sessionId, session);
+  bridge.sendVoiceStatus(sessionId, "listening");
+  log.info(`[voice] session started: ${sessionId}`);
+}
+
+async function handleVoiceText(
+  ctx: ChannelGatewayContext<ResolvedSuperAgentAccount>,
+  instruction: string,
+  sessionId: string,
+  log: { info: (s: string) => void; warn: (s: string) => void; error: (s: string) => void }
+): Promise<string> {
+  const runtime = getSuperAgentRuntime();
+  const channelRuntime = ctx.channelRuntime ?? runtime.channel;
+  const cfg = ctx.cfg;
+
+  const route = channelRuntime.routing.resolveAgentRoute({
+    cfg,
+    channel: CHANNEL_ID,
+    accountId: ctx.account.accountId,
+    peer: { kind: "user", id: sessionId },
+  });
+
+  const storePath = channelRuntime.session.resolveStorePath(undefined, {
+    agentId: route.agentId,
+  });
+
+  const envelopeOptions = channelRuntime.reply.resolveEnvelopeFormatOptions(cfg);
+  const previousTimestamp = channelRuntime.session.readSessionUpdatedAt({
+    storePath,
+    sessionKey: route.sessionKey,
+  });
+  const body = channelRuntime.reply.formatAgentEnvelope({
+    channel: CHANNEL_ID,
+    from: `voice:${sessionId}`,
+    timestamp: Date.now(),
+    previousTimestamp,
+    envelope: envelopeOptions,
+    body: instruction,
+  });
+
+  const ctxPayload = channelRuntime.reply.finalizeInboundContext({
+    Body: body,
+    RawBody: instruction,
+    CommandBody: instruction,
+    BodyForAgent: instruction,
+    From: `${CHANNEL_ID}:${sessionId}`,
+    To: `${CHANNEL_ID}:${ctx.account.accountId}`,
+    SessionKey: route.sessionKey,
+    AccountId: ctx.account.accountId,
+    ChatType: "direct",
+    SenderName: `voice:${sessionId}`,
+    SenderId: sessionId,
+    Provider: CHANNEL_ID,
+    Surface: CHANNEL_ID,
+    OriginatingChannel: CHANNEL_ID,
+    OriginatingTo: sessionId,
+    CommandAuthorized: true,
+    Timestamp: Date.now(),
+  });
+
+  await channelRuntime.session.recordInboundSession({
+    storePath,
+    sessionKey: route.sessionKey,
+    ctx: ctxPayload,
+    onRecordError: (err: unknown) => {
+      log.error(`[voice] session record error: ${err}`);
+    },
+  });
+
+  let replyText = "";
+
+  await channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher({
+    ctx: ctxPayload,
+    cfg,
+    dispatcherOptions: {
+      deliver: async (payload: unknown) => {
+        const p = (payload && typeof payload === "object" ? payload : {}) as Record<string, unknown>;
+        const text = typeof p.text === "string" ? p.text.trim() : "";
+        if (text) {
+          replyText = replyText ? `${replyText}\n${text}` : text;
+        }
+      },
+      onError: (err: unknown, info: { kind: string }) => {
+        log.error(`[voice] dispatch error (${info.kind}): ${err}`);
+      },
+    },
+  });
+
+  return replyText;
+}
