@@ -1,6 +1,9 @@
 /**
  * Doubao (ByteDance) Streaming ASR — WebSocket Client
- * Adapted from openclaw-voice/src/doubao-asr.ts
+ *
+ * Supports two modes:
+ * 1. Streaming: new DoubaoASR() → start() → feedPCM() ... → finish()
+ * 2. One-shot:  transcribePCM(buffer) (convenience wrapper)
  */
 
 import WebSocket from "ws";
@@ -89,90 +92,169 @@ export interface DoubaoASRConfig {
   language?: string;
 }
 
-export async function transcribePCM(
-  pcmBuffer: Buffer,
-  cfg: DoubaoASRConfig,
-  log?: { info: (s: string) => void; error: (s: string) => void }
-): Promise<string> {
-  const headers: Record<string, string> = {
-    "x-api-key": cfg.apiKey,
-    "X-Api-Resource-Id": "volc.bigasr.sauc.duration",
-    "X-Api-Connect-Id": randomUUID(),
-  };
+/**
+ * Streaming ASR client.
+ * Usage: start() → feedPCM() as audio arrives → finish() returns final text.
+ */
+export class DoubaoASR {
+  private ws: WebSocket | null = null;
+  private started = false;
+  private finalText = "";
+  private resolved = false;
+  private resolveResult!: (text: string) => void;
+  private rejectResult!: (err: Error) => void;
+  private resultPromise: Promise<string>;
+  private timeout: ReturnType<typeof setTimeout> | null = null;
+  private onPartial?: (text: string) => void;
 
-  return new Promise((resolve, reject) => {
-    const ws = new WebSocket(
-      "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
-      { headers }
-    );
+  constructor(
+    private cfg: DoubaoASRConfig,
+    private log?: { info: (s: string) => void; error: (s: string) => void },
+  ) {
+    this.resultPromise = new Promise<string>((resolve, reject) => {
+      this.resolveResult = resolve;
+      this.rejectResult = reject;
+    });
+  }
 
-    const timeout = setTimeout(() => {
-      log?.error("[voice:asr] timeout 15s, finalText=" + JSON.stringify(finalText));
-      ws.terminate();
-      resolve(finalText);
-    }, 15000);
+  /**
+   * Open WebSocket and send ASR config. Must be called before feedPCM().
+   * @param onPartial Optional callback for intermediate transcription results.
+   */
+  async start(onPartial?: (text: string) => void): Promise<void> {
+    this.onPartial = onPartial;
 
-    let finalText = "";
-    let resolved = false;
+    const headers: Record<string, string> = {
+      "x-api-key": this.cfg.apiKey,
+      "X-Api-Resource-Id": "volc.bigasr.sauc.duration",
+      "X-Api-Connect-Id": randomUUID(),
+    };
 
-    function done(text: string) {
-      if (resolved) return;
-      resolved = true;
-      clearTimeout(timeout);
-      try { ws.close(); } catch {}
-      resolve(text);
-    }
+    await new Promise<void>((resolve, reject) => {
+      this.ws = new WebSocket(
+        "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
+        { headers },
+      );
 
-    ws.once("open", () => {
-      log?.info(`[voice:asr] connected, sending ${pcmBuffer.length} bytes`);
+      this.ws.once("open", () => {
+        this.log?.info("[voice:asr] connected, sending config");
 
-      ws.send(buildFullClientRequest({
-        user: { uid: "voice-user" },
-        audio: { format: "pcm", rate: 16000, bits: 16, channel: 1, language: cfg.language ?? "zh-CN" },
-        request: { model_name: "bigmodel", enable_itn: true, enable_punc: true },
-      }));
+        this.ws!.send(buildFullClientRequest({
+          user: { uid: "voice-user" },
+          audio: { format: "pcm", rate: 16000, bits: 16, channel: 1, language: this.cfg.language ?? "zh-CN" },
+          request: { model_name: "bigmodel", enable_itn: true, enable_punc: true },
+        }));
 
-      const CHUNK_SIZE = 6400;
-      let offset = 0;
-      while (offset < pcmBuffer.length) {
-        const end = Math.min(offset + CHUNK_SIZE, pcmBuffer.length);
-        ws.send(buildAudioFrame(pcmBuffer.slice(offset, end)));
-        offset = end;
-      }
+        this.started = true;
+        this.setupListeners();
+        resolve();
+      });
 
-      log?.info("[voice:asr] all audio sent, closing to signal end of stream");
-      ws.close();
+      this.ws.once("error", reject);
     });
 
-    ws.on("message", (data: Buffer) => {
-      if (resolved) return;
+    // Safety timeout — if no final result after 30s, resolve with whatever we have
+    this.timeout = setTimeout(() => {
+      this.log?.error("[voice:asr] timeout 30s, finalText=" + JSON.stringify(this.finalText));
+      this.done(this.finalText);
+    }, 30000);
+  }
+
+  /** Send a PCM audio chunk to ASR. Can be called as audio arrives. */
+  feedPCM(chunk: Buffer): void {
+    if (!this.started || !this.ws || this.resolved) return;
+    this.ws.send(buildAudioFrame(chunk));
+  }
+
+  /**
+   * Signal end of audio stream and wait for the final transcription result.
+   */
+  async finish(): Promise<string> {
+    if (!this.started || !this.ws) return this.finalText;
+
+    this.log?.info("[voice:asr] signaling end of audio stream");
+    // Close the WebSocket to signal end-of-stream (same as original approach)
+    try { this.ws.close(); } catch {}
+
+    return this.resultPromise;
+  }
+
+  /** Abort the ASR session immediately. */
+  destroy(): void {
+    this.done(this.finalText);
+    try { this.ws?.terminate(); } catch {}
+  }
+
+  private setupListeners(): void {
+    this.ws!.on("message", (data: Buffer) => {
+      if (this.resolved) return;
 
       const parsed = parseASRFrame(data);
       if (!parsed) return;
 
       if (parsed.error) {
-        log?.error(`[voice:asr] server error: ${parsed.error}`);
-        if (!resolved) { resolved = true; clearTimeout(timeout); ws.close(); reject(new Error(parsed.error)); }
+        this.log?.error(`[voice:asr] server error: ${parsed.error}`);
+        this.fail(new Error(parsed.error));
         return;
       }
 
       if (parsed.text) {
-        finalText = parsed.text;
+        this.finalText = parsed.text;
+        this.onPartial?.(parsed.text);
       }
 
       if (parsed.isFinal) {
-        log?.info(`[voice:asr] final: "${finalText}"`);
-        done(finalText);
+        this.log?.info(`[voice:asr] final: "${this.finalText}"`);
+        this.done(this.finalText);
       }
     });
 
-    ws.on("error", (err) => {
-      log?.error(`[voice:asr] ws error: ${err.message}`);
-      if (!resolved) { resolved = true; clearTimeout(timeout); reject(new Error(`ASR WebSocket error: ${err.message}`)); }
+    this.ws!.on("error", (err) => {
+      this.log?.error(`[voice:asr] ws error: ${err.message}`);
+      this.fail(new Error(`ASR WebSocket error: ${err.message}`));
     });
 
-    ws.on("close", () => {
-      if (!resolved) done(finalText);
+    this.ws!.on("close", () => {
+      // Server closed — resolve with whatever we have
+      if (!this.resolved) this.done(this.finalText);
     });
-  });
+  }
+
+  private done(text: string): void {
+    if (this.resolved) return;
+    this.resolved = true;
+    if (this.timeout) clearTimeout(this.timeout);
+    this.resolveResult(text);
+  }
+
+  private fail(err: Error): void {
+    if (this.resolved) return;
+    this.resolved = true;
+    if (this.timeout) clearTimeout(this.timeout);
+    this.rejectResult(err);
+  }
+}
+
+/**
+ * One-shot convenience wrapper — sends all PCM at once.
+ * Kept for backward compatibility.
+ */
+export async function transcribePCM(
+  pcmBuffer: Buffer,
+  cfg: DoubaoASRConfig,
+  log?: { info: (s: string) => void; error: (s: string) => void }
+): Promise<string> {
+  const asr = new DoubaoASR(cfg, log);
+  await asr.start();
+
+  log?.info(`[voice:asr] sending ${pcmBuffer.length} bytes`);
+  const CHUNK_SIZE = 6400;
+  let offset = 0;
+  while (offset < pcmBuffer.length) {
+    const end = Math.min(offset + CHUNK_SIZE, pcmBuffer.length);
+    asr.feedPCM(pcmBuffer.slice(offset, end));
+    offset = end;
+  }
+
+  return asr.finish();
 }

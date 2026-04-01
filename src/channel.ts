@@ -183,7 +183,9 @@ export const superAgentPlugin: ChannelPlugin<ResolvedSuperAgentAccount> = {
           onConnected: () => log.info("connected to Super Agent Server"),
           onDisconnected: () => log.warn("disconnected from Super Agent Server"),
           onVoiceStart: (params: VoiceStartParams) => {
-            handleVoiceStart(ctx, bridge, params, asrConfig, ttsConfig, log);
+            handleVoiceStart(ctx, bridge, params, asrConfig, ttsConfig, log).catch((err) => {
+              log.error(`[voice] voice.start error: ${err}`);
+            });
           },
           onVoicePcm: (params: VoicePcmParams) => {
             const session = activeSessions.get(params.session_id);
@@ -441,14 +443,14 @@ export { activeBridges };
 
 // ─── Voice Session Handling ───────────────────────────────────────────────────
 
-function handleVoiceStart(
+async function handleVoiceStart(
   ctx: ChannelGatewayContext<ResolvedSuperAgentAccount>,
   bridge: WsBridge,
   params: VoiceStartParams,
   asrConfig: ReturnType<typeof buildASRConfig>,
   ttsConfig: ReturnType<typeof buildTTSConfig>,
   log: { info: (s: string) => void; warn: (s: string) => void; error: (s: string) => void }
-): void {
+): Promise<void> {
   const sessionId = params.session_id;
 
   // Destroy any existing session for this sessionId
@@ -469,8 +471,8 @@ function handleVoiceStart(
     {
       asrConfig,
       ttsConfig,
-      processText: async (text: string) => {
-        return handleVoiceText(ctx, text, sessionId, log);
+      processText: async (text: string, onTextChunk: (chunk: string) => void) => {
+        await handleVoiceText(ctx, text, sessionId, onTextChunk, log);
       },
     },
     {
@@ -484,6 +486,18 @@ function handleVoiceStart(
   );
 
   activeSessions.set(sessionId, session);
+
+  // Start streaming ASR immediately — PCM chunks will be forwarded as they arrive
+  try {
+    await session.startListening();
+  } catch (err) {
+    log.error(`[voice] failed to start ASR: ${err}`);
+    bridge.sendVoiceError(sessionId, `Failed to start ASR: ${err}`);
+    activeSessions.delete(sessionId);
+    session.destroy().catch(() => {});
+    return;
+  }
+
   bridge.sendVoiceStatus(sessionId, "listening");
   log.info(`[voice] session started: ${sessionId}`);
 }
@@ -492,8 +506,9 @@ async function handleVoiceText(
   ctx: ChannelGatewayContext<ResolvedSuperAgentAccount>,
   instruction: string,
   sessionId: string,
+  onTextChunk: (chunk: string) => void,
   log: { info: (s: string) => void; warn: (s: string) => void; error: (s: string) => void }
-): Promise<string> {
+): Promise<void> {
   const runtime = getSuperAgentRuntime();
   const channelRuntime = ctx.channelRuntime ?? runtime.channel;
   const cfg = ctx.cfg;
@@ -552,8 +567,6 @@ async function handleVoiceText(
     },
   });
 
-  let replyText = "";
-
   await channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher({
     ctx: ctxPayload,
     cfg,
@@ -562,7 +575,7 @@ async function handleVoiceText(
         const p = (payload && typeof payload === "object" ? payload : {}) as Record<string, unknown>;
         const text = typeof p.text === "string" ? p.text.trim() : "";
         if (text) {
-          replyText = replyText ? `${replyText}\n${text}` : text;
+          onTextChunk(text);
         }
       },
       onError: (err: unknown, info: { kind: string }) => {
@@ -570,6 +583,4 @@ async function handleVoiceText(
       },
     },
   });
-
-  return replyText;
 }

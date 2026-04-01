@@ -118,6 +118,17 @@ export interface DoubaoTTSConfig {
   sampleRate?: number;
 }
 
+/**
+ * Handle returned by synthesizeStreaming(). Feed text chunks as they arrive
+ * from the Agent, then call finish() when the Agent reply is complete.
+ */
+export interface TTSStreamHandle {
+  /** Send a text chunk to TTS immediately. Can be called multiple times. */
+  feedText(text: string): void;
+  /** Signal that no more text will arrive. Resolves when all audio has been delivered. */
+  finish(): Promise<void>;
+}
+
 export class DoubaoTTS {
   private ws: WebSocket | null = null;
   private connected = false;
@@ -175,11 +186,28 @@ export class DoubaoTTS {
     this.ws!.on("close", () => { this.connected = false; });
   }
 
+  /**
+   * One-shot synthesize — sends full text at once.
+   */
   async synthesize(
     text: string,
     onChunk: (audioChunk: Buffer) => void,
     interruptSignal?: { aborted: boolean }
   ): Promise<void> {
+    const handle = await this.synthesizeStreaming(onChunk, interruptSignal);
+    handle.feedText(text);
+    await handle.finish();
+  }
+
+  /**
+   * Streaming synthesize — returns a handle to feed text incrementally.
+   * Audio chunks are delivered via onChunk as soon as TTS produces them.
+   * Call handle.feedText() for each Agent text chunk, then handle.finish().
+   */
+  async synthesizeStreaming(
+    onChunk: (audioChunk: Buffer) => void,
+    interruptSignal?: { aborted: boolean }
+  ): Promise<TTSStreamHandle> {
     if (!this.connected || !this.ws) {
       await this.connect();
     }
@@ -208,76 +236,95 @@ export class DoubaoTTS {
 
     await this.waitForEvent(EVENT.SessionStarted, 10000);
 
-    if (interruptSignal?.aborted) return;
+    if (interruptSignal?.aborted) {
+      return { feedText() {}, finish: () => Promise.resolve() };
+    }
 
-    const taskPayload = JSON.stringify({
-      event: EVENT.TaskRequest,
-      req_params: { text },
+    const ws = this.ws!;
+
+    // Set up audio listener that resolves when session finishes
+    let resolveSession: () => void;
+    let rejectSession: (err: Error) => void;
+    const sessionDone = new Promise<void>((resolve, reject) => {
+      resolveSession = resolve;
+      rejectSession = reject;
     });
-    this.ws!.send(
-      buildFrame({
-        msgType: 0x01,
-        serialization: 0x01,
-        event: EVENT.TaskRequest,
-        sessionId,
-        payload: taskPayload,
-      })
-    );
 
-    this.ws!.send(
-      buildFrame({
-        msgType: 0x01,
-        serialization: 0x01,
-        event: EVENT.FinishSession,
-        sessionId,
-        payload: "{}",
-      })
-    );
+    const timeout = setTimeout(() => {
+      cleanup();
+      rejectSession!(new Error("TTS session timeout"));
+    }, 60000);
 
-    await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => {
+    const onMessage = (data: Buffer) => {
+      if (interruptSignal?.aborted) {
         cleanup();
-        reject(new Error("TTS session timeout"));
-      }, 60000);
+        resolveSession!();
+        return;
+      }
 
-      const onMessage = (data: Buffer) => {
-        if (interruptSignal?.aborted) {
-          cleanup();
-          resolve();
-          return;
+      const parsed = parseFrame(data);
+
+      if (parsed.error) {
+        cleanup();
+        rejectSession!(new Error(`TTS error: ${parsed.error.message}`));
+        return;
+      }
+
+      if (parsed.event === EVENT.TTSResponse && parsed.payload) {
+        onChunk(parsed.payload);
+      } else if (
+        parsed.event === EVENT.SessionFinished ||
+        parsed.event === EVENT.SessionFailed
+      ) {
+        cleanup();
+        if (parsed.event === EVENT.SessionFailed) {
+          const msg = parsed.payload?.toString("utf8") ?? "unknown";
+          rejectSession!(new Error(`TTS session failed: ${msg}`));
+        } else {
+          resolveSession!();
         }
+      }
+    };
 
-        const parsed = parseFrame(data);
+    const cleanup = () => {
+      clearTimeout(timeout);
+      ws.off("message", onMessage);
+    };
 
-        if (parsed.error) {
-          cleanup();
-          reject(new Error(`TTS error: ${parsed.error.message}`));
-          return;
-        }
+    ws.on("message", onMessage);
 
-        if (parsed.event === EVENT.TTSResponse && parsed.payload) {
-          onChunk(parsed.payload);
-        } else if (
-          parsed.event === EVENT.SessionFinished ||
-          parsed.event === EVENT.SessionFailed
-        ) {
-          cleanup();
-          if (parsed.event === EVENT.SessionFailed) {
-            const msg = parsed.payload?.toString("utf8") ?? "unknown";
-            reject(new Error(`TTS session failed: ${msg}`));
-          } else {
-            resolve();
-          }
-        }
-      };
+    return {
+      feedText: (text: string) => {
+        if (interruptSignal?.aborted) return;
+        const taskPayload = JSON.stringify({
+          event: EVENT.TaskRequest,
+          req_params: { text },
+        });
+        ws.send(
+          buildFrame({
+            msgType: 0x01,
+            serialization: 0x01,
+            event: EVENT.TaskRequest,
+            sessionId,
+            payload: taskPayload,
+          })
+        );
+      },
 
-      const cleanup = () => {
-        clearTimeout(timeout);
-        this.ws!.off("message", onMessage);
-      };
-
-      this.ws!.on("message", onMessage);
-    });
+      finish: async () => {
+        if (interruptSignal?.aborted) return;
+        ws.send(
+          buildFrame({
+            msgType: 0x01,
+            serialization: 0x01,
+            event: EVENT.FinishSession,
+            sessionId,
+            payload: "{}",
+          })
+        );
+        await sessionDone;
+      },
+    };
   }
 
   private waitForEvent(event: number, timeoutMs: number): Promise<ParsedFrame> {

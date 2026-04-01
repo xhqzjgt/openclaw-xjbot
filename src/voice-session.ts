@@ -1,10 +1,15 @@
 /**
  * Voice session management for super-agent channel.
  * Manages the lifecycle of a single voice call: idle → listening → thinking → speaking → idle
+ *
+ * Full streaming pipeline:
+ * - ASR: PCM chunks are streamed to ASR as they arrive (no buffering)
+ * - Agent: text is processed and streamed back
+ * - TTS: Agent text chunks are fed to TTS as they arrive
  */
 
-import { transcribePCM, type DoubaoASRConfig } from "./voice-asr.js";
-import { DoubaoTTS, type DoubaoTTSConfig } from "./voice-tts.js";
+import { DoubaoASR, type DoubaoASRConfig } from "./voice-asr.js";
+import { DoubaoTTS, type DoubaoTTSConfig, type TTSStreamHandle } from "./voice-tts.js";
 
 export type VoiceState = "listening" | "thinking" | "speaking" | "idle";
 
@@ -19,13 +24,18 @@ export interface VoiceSessionCallbacks {
 export interface VoiceSessionConfig {
   asrConfig: DoubaoASRConfig;
   ttsConfig: DoubaoTTSConfig;
-  processText: (text: string) => Promise<string>;
+  /**
+   * Process transcribed text through the Agent pipeline.
+   * Calls onTextChunk for each text chunk as it arrives from the Agent.
+   * The returned promise resolves when the Agent is done producing text.
+   */
+  processText: (text: string, onTextChunk: (chunk: string) => void) => Promise<void>;
 }
 
 export class VoiceSession {
-  private pcmChunks: Buffer[] = [];
   private state: VoiceState = "idle";
   private tts: DoubaoTTS;
+  private asr: DoubaoASR | null = null;
   private destroyed = false;
   private interruptSignal = { aborted: false };
   private processingPromise: Promise<void> | null = null;
@@ -39,39 +49,59 @@ export class VoiceSession {
     this.tts = new DoubaoTTS(cfg.ttsConfig);
   }
 
-  handlePcm(data: Buffer): void {
+  /**
+   * Start streaming ASR session. Called when voice.start arrives.
+   * After this, handlePcm() sends audio directly to ASR.
+   */
+  async startListening(): Promise<void> {
     if (this.destroyed) return;
-    this.pcmChunks.push(data);
+
+    this.asr = new DoubaoASR(this.cfg.asrConfig, {
+      info: (s) => this.log.info(s),
+      error: (s) => this.log.error(s),
+    });
+
+    await this.asr.start((partialText) => {
+      // Send partial transcripts to the client for real-time display
+      if (!this.destroyed && partialText) {
+        this.callbacks.onTranscript(partialText);
+      }
+    });
+
+    this.log.info(`[voice-session:${this.sessionId}] ASR started, streaming PCM`);
   }
 
+  /** Send PCM chunk directly to ASR — no buffering. */
+  handlePcm(data: Buffer): void {
+    if (this.destroyed) return;
+    if (this.asr) {
+      this.asr.feedPCM(data);
+    }
+  }
+
+  /** User stopped speaking — finalize ASR and run Agent→TTS pipeline. */
   async handleSpeechEnd(): Promise<void> {
     if (this.destroyed) return;
     if (this.state !== "idle" && this.state !== "listening") return;
 
-    const pcmBuffer = Buffer.concat(this.pcmChunks);
-    this.pcmChunks = [];
-
-    this.processingPromise = this.runPipeline(pcmBuffer);
+    this.processingPromise = this.runPipeline();
     await this.processingPromise;
   }
 
-  private async runPipeline(pcmBuffer: Buffer): Promise<void> {
+  private async runPipeline(): Promise<void> {
     try {
-      // Step 1: ASR
       this.setState("thinking");
       const log = this.log;
 
-      if (pcmBuffer.length === 0) {
-        log.warn(`[voice-session:${this.sessionId}] empty PCM buffer, skipping`);
+      // Finalize ASR — get the final transcript
+      if (!this.asr) {
+        log.warn(`[voice-session:${this.sessionId}] no ASR session, skipping`);
         this.setState("idle");
         return;
       }
 
-      log.info(`[voice-session:${this.sessionId}] transcribing ${pcmBuffer.length} bytes`);
-      const text = await transcribePCM(pcmBuffer, this.cfg.asrConfig, {
-        info: (s) => log.info(s),
-        error: (s) => log.error(s),
-      });
+      const text = await this.asr.finish();
+      this.asr = null;
 
       if (this.destroyed) return;
 
@@ -81,37 +111,72 @@ export class VoiceSession {
         return;
       }
 
+      // Send the final transcript
       this.callbacks.onTranscript(text);
       log.info(`[voice-session:${this.sessionId}] transcript: "${text}"`);
 
-      // Step 2: Agent processing
-      const reply = await this.cfg.processText(text);
+      // Streaming Agent → TTS pipeline
+      this.interruptSignal = { aborted: false };
+
+      const pendingChunks: string[] = [];
+      let ttsHandle: TTSStreamHandle | null = null;
+      let ttsReady = false;
+      let ttsStartPromise: Promise<void> | null = null;
+      let hasText = false;
+
+      log.info(`[voice-session:${this.sessionId}] starting streaming agent → TTS pipeline`);
+
+      await this.cfg.processText(text, (chunk: string) => {
+        if (this.destroyed || this.interruptSignal.aborted || !chunk.trim()) return;
+
+        if (!hasText) {
+          hasText = true;
+          this.setState("speaking");
+          ttsStartPromise = this.tts.synthesizeStreaming(
+            (audioChunk) => {
+              if (!this.destroyed && !this.interruptSignal.aborted) {
+                this.callbacks.onAudioChunk(audioChunk);
+              }
+            },
+            this.interruptSignal,
+          ).then((handle) => {
+            ttsHandle = handle;
+            for (const pending of pendingChunks) {
+              handle.feedText(pending);
+            }
+            pendingChunks.length = 0;
+            ttsReady = true;
+          }).catch((err) => {
+            log.error(`[voice-session:${this.sessionId}] TTS start error: ${err}`);
+          });
+        }
+
+        if (ttsReady && ttsHandle) {
+          ttsHandle.feedText(chunk);
+        } else {
+          pendingChunks.push(chunk);
+        }
+      });
 
       if (this.destroyed || this.interruptSignal.aborted) {
         this.setState("idle");
         return;
       }
 
-      if (!reply || reply.trim() === "") {
-        log.info(`[voice-session:${this.sessionId}] empty agent reply, skipping TTS`);
-        this.setState("idle");
-        return;
-      }
-
-      // Step 3: TTS
-      this.setState("speaking");
-      this.interruptSignal = { aborted: false };
-
-      log.info(`[voice-session:${this.sessionId}] synthesizing: "${reply.slice(0, 80)}..."`);
-      await this.tts.synthesize(reply, (chunk) => {
-        if (!this.destroyed && !this.interruptSignal.aborted) {
-          this.callbacks.onAudioChunk(chunk);
+      if (ttsStartPromise) {
+        await ttsStartPromise;
+        if (ttsHandle) {
+          await ttsHandle.finish();
         }
-      }, this.interruptSignal);
+      }
 
       if (this.destroyed) return;
 
-      this.callbacks.onAudioEnd();
+      if (!hasText) {
+        log.info(`[voice-session:${this.sessionId}] empty agent reply, skipping TTS`);
+      } else {
+        this.callbacks.onAudioEnd();
+      }
       this.setState("idle");
     } catch (err) {
       if (this.destroyed) return;
@@ -126,6 +191,10 @@ export class VoiceSession {
     if (this.destroyed) return;
     this.log.info(`[voice-session:${this.sessionId}] interrupted`);
     this.interruptSignal.aborted = true;
+    if (this.asr) {
+      this.asr.destroy();
+      this.asr = null;
+    }
     if (this.state === "speaking") {
       this.setState("idle");
     }
@@ -144,7 +213,10 @@ export class VoiceSession {
   async destroy(): Promise<void> {
     this.destroyed = true;
     this.interruptSignal.aborted = true;
-    this.pcmChunks = [];
+    if (this.asr) {
+      this.asr.destroy();
+      this.asr = null;
+    }
     try {
       await this.tts.disconnect();
     } catch {}
