@@ -41,9 +41,9 @@ export class VoiceSession {
   private interruptSignal = { aborted: false };
   private processingPromise: Promise<void> | null = null;
 
-  /** Buffer PCM chunks while ASR is being lazily started */
+  /** Buffer PCM chunks while ASR is connecting */
   private pcmBuffer: Buffer[] = [];
-  /** Promise for pending ASR startup (lazy start from handlePcm) */
+  /** Promise tracking any in-progress ASR startup */
   private asrStartPromise: Promise<void> | null = null;
 
   constructor(
@@ -56,8 +56,8 @@ export class VoiceSession {
   }
 
   /**
-   * Start streaming ASR session. Called when voice.start arrives.
-   * After this, handlePcm() sends audio directly to ASR.
+   * Start streaming ASR session. Called when voice.start arrives
+   * and lazily from handlePcm when ASR is needed for the next round.
    */
   async startListening(): Promise<void> {
     if (this.destroyed) return;
@@ -68,55 +68,57 @@ export class VoiceSession {
       this.asr = null;
     }
 
-    this.asr = new DoubaoASR(this.cfg.asrConfig, {
-      info: (s) => this.log.info(s),
-      error: (s) => this.log.error(s),
-    });
-
-    await this.asr.start((partialText) => {
-      // Send partial transcripts to the client for real-time display
-      if (!this.destroyed && partialText) {
-        this.callbacks.onTranscript(partialText);
-      }
-    });
-
-    this.log.info(`[voice-session:${this.sessionId}] ASR started, streaming PCM`);
-  }
-
-  /**
-   * Lazily ensure ASR is running. If ASR is null or dead, start a new one
-   * and buffer PCM chunks until it's ready.
-   */
-  private ensureASR(firstChunk: Buffer): void {
-    this.pcmBuffer.push(firstChunk);
-
-    if (this.asrStartPromise) return; // already starting
-
-    this.asrStartPromise = this.startListening()
-      .then(() => {
-        // Flush buffered PCM to the new ASR
-        for (const chunk of this.pcmBuffer) {
-          this.asr?.feedPCM(chunk);
-        }
-        this.pcmBuffer = [];
-        this.asrStartPromise = null;
-      })
-      .catch((err) => {
-        this.log.error(`[voice-session:${this.sessionId}] lazy ASR start failed: ${err}`);
-        this.pcmBuffer = [];
-        this.asrStartPromise = null;
+    const startPromise = (async () => {
+      this.asr = new DoubaoASR(this.cfg.asrConfig, {
+        info: (s) => this.log.info(s),
+        error: (s) => this.log.error(s),
       });
+
+      await this.asr.start((partialText) => {
+        if (!this.destroyed && partialText) {
+          this.callbacks.onTranscript(partialText);
+        }
+      });
+
+      // Flush any PCM that arrived while connecting
+      for (const chunk of this.pcmBuffer) {
+        this.asr?.feedPCM(chunk);
+      }
+      this.pcmBuffer = [];
+      this.log.info(`[voice-session:${this.sessionId}] ASR started, streaming PCM`);
+    })();
+
+    this.asrStartPromise = startPromise;
+
+    try {
+      await startPromise;
+    } finally {
+      // Only clear if this is still the active start
+      if (this.asrStartPromise === startPromise) {
+        this.asrStartPromise = null;
+      }
+    }
   }
 
   /** Send PCM chunk directly to ASR — no buffering. */
   handlePcm(data: Buffer): void {
     if (this.destroyed) return;
 
+    if (this.asrStartPromise) {
+      // ASR is connecting — buffer the chunk, it will be flushed when ready
+      this.pcmBuffer.push(data);
+      return;
+    }
+
     if (this.asr && this.asr.isAlive) {
       this.asr.feedPCM(data);
     } else {
       // ASR is null or dead (timed out) — lazily start a new one
-      this.ensureASR(data);
+      this.pcmBuffer.push(data);
+      this.startListening().catch((err) => {
+        this.log.error(`[voice-session:${this.sessionId}] lazy ASR start failed: ${err}`);
+        this.pcmBuffer = [];
+      });
     }
   }
 
@@ -125,7 +127,7 @@ export class VoiceSession {
     if (this.destroyed) return;
     if (this.state !== "idle" && this.state !== "listening") return;
 
-    // Wait for pending lazy ASR startup before proceeding
+    // Wait for pending ASR startup before proceeding
     if (this.asrStartPromise) {
       await this.asrStartPromise;
     }
