@@ -391,7 +391,7 @@ async function handleInboundExecute(
             });
           }
           // Upload local files to server, then send as file chunk
-          const attachments = await uploadAndBuildAttachments(bridge, mediaUrls, log);
+          const attachments = await uploadAndBuildAttachments(bridge, mediaUrls, { error: (msg: string) => ctx.log?.error?.(msg) });
           if (attachments.length > 0) {
             bridge.sendAgentStream({
               session_id: sessionId,
