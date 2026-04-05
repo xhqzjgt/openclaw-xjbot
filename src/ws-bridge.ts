@@ -304,6 +304,20 @@ export class WsBridge {
     return this.ws?.readyState === WebSocket.OPEN;
   }
 
+  get serverUrl(): string {
+    return this.config.serverUrl;
+  }
+
+  /** Returns current access token, refreshing if needed. */
+  async getAccessToken(): Promise<string | null> {
+    try {
+      await this.ensureTokens();
+      return this.tokens?.access_token ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   // ── Auth ─────────────────────────────────────────────────────────────────
 
   private async ensureTokens(): Promise<void> {

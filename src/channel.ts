@@ -22,6 +22,7 @@ import {
 import { VoiceSession } from "./voice-session.js";
 import { resolveVoiceConfig, buildTTSConfig, buildASRConfig } from "./voice-config.js";
 import { downloadImageToLocal } from "./download-image.js";
+import { uploadLocalFile } from "./upload-file.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -378,16 +379,29 @@ async function handleInboundExecute(
             : [];
 
         if (mediaUrls.length > 0) {
-          const mediaBlock = mediaUrls.map((url) => `Attachment: ${url}`).join("\n");
-          const combined = text ? `${text}\n\n${mediaBlock}` : mediaBlock;
-          bridge.sendAgentStream({
-            session_id: sessionId,
-            request_id: requestId,
-            message_id: messageId,
-            chunk_type: "text",
-            created_at: Date.now(),
-            data: { content: combined },
-          });
+          // Send text part first (if any)
+          if (text) {
+            bridge.sendAgentStream({
+              session_id: sessionId,
+              request_id: requestId,
+              message_id: messageId,
+              chunk_type: "text",
+              created_at: Date.now(),
+              data: { content: text },
+            });
+          }
+          // Upload local files to server, then send as file chunk
+          const attachments = await uploadAndBuildAttachments(bridge, mediaUrls, log);
+          if (attachments.length > 0) {
+            bridge.sendAgentStream({
+              session_id: sessionId,
+              request_id: requestId,
+              message_id: crypto.randomUUID(),
+              chunk_type: "file",
+              created_at: Date.now(),
+              data: { attachments },
+            });
+          }
         } else if (text) {
           bridge.sendAgentStream({
             session_id: sessionId,
@@ -423,6 +437,49 @@ function getActiveBridge(): WsBridge | undefined {
     if (bridge.connected) return bridge;
   }
   return undefined;
+}
+
+/**
+ * Upload local image files to the server and return attachment metadata
+ * that can be sent as a file chunk to the mobile app.
+ */
+async function uploadAndBuildAttachments(
+  bridge: WsBridge,
+  mediaUrls: string[],
+  log: { error: (msg: string) => void },
+): Promise<Array<{
+  file_id: string;
+  file_name: string;
+  file_type: "image" | "video" | "audio" | "file";
+  mime_type: string;
+  size_bytes: number;
+  url: string;
+}>> {
+  const results: Array<{
+    file_id: string;
+    file_name: string;
+    file_type: "image" | "video" | "audio" | "file";
+    mime_type: string;
+    size_bytes: number;
+    url: string;
+  }> = [];
+
+  const token = await bridge.getAccessToken();
+  if (!token) {
+    log.error(`[${CHANNEL_ID}] cannot upload files: no access token`);
+    return results;
+  }
+
+  for (const mediaUrl of mediaUrls) {
+    try {
+      const att = await uploadLocalFile(bridge.serverUrl, token, mediaUrl);
+      if (att) results.push(att);
+    } catch (err) {
+      log.error(`[${CHANNEL_ID}] failed to upload media ${mediaUrl}: ${err}`);
+    }
+  }
+
+  return results;
 }
 
 // ─── Confirm/Clarify API ─────────────────────────────────────────────────────
