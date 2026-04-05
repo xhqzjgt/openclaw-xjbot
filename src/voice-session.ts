@@ -16,6 +16,7 @@ export type VoiceState = "listening" | "thinking" | "speaking" | "idle";
 export interface VoiceSessionCallbacks {
   onStatus: (state: VoiceState) => void;
   onTranscript: (text: string) => void;
+  onAiText: (chunk: string) => void;
   onAudioChunk: (data: Buffer) => void;
   onAudioEnd: () => void;
   onError: (message: string) => void;
@@ -40,6 +41,11 @@ export class VoiceSession {
   private interruptSignal = { aborted: false };
   private processingPromise: Promise<void> | null = null;
 
+  /** Buffer PCM chunks while ASR is being lazily started */
+  private pcmBuffer: Buffer[] = [];
+  /** Promise for pending ASR startup (lazy start from handlePcm) */
+  private asrStartPromise: Promise<void> | null = null;
+
   constructor(
     readonly sessionId: string,
     private cfg: VoiceSessionConfig,
@@ -56,6 +62,12 @@ export class VoiceSession {
   async startListening(): Promise<void> {
     if (this.destroyed) return;
 
+    // Clean up any existing ASR
+    if (this.asr) {
+      this.asr.destroy();
+      this.asr = null;
+    }
+
     this.asr = new DoubaoASR(this.cfg.asrConfig, {
       info: (s) => this.log.info(s),
       error: (s) => this.log.error(s),
@@ -71,11 +83,40 @@ export class VoiceSession {
     this.log.info(`[voice-session:${this.sessionId}] ASR started, streaming PCM`);
   }
 
+  /**
+   * Lazily ensure ASR is running. If ASR is null or dead, start a new one
+   * and buffer PCM chunks until it's ready.
+   */
+  private ensureASR(firstChunk: Buffer): void {
+    this.pcmBuffer.push(firstChunk);
+
+    if (this.asrStartPromise) return; // already starting
+
+    this.asrStartPromise = this.startListening()
+      .then(() => {
+        // Flush buffered PCM to the new ASR
+        for (const chunk of this.pcmBuffer) {
+          this.asr?.feedPCM(chunk);
+        }
+        this.pcmBuffer = [];
+        this.asrStartPromise = null;
+      })
+      .catch((err) => {
+        this.log.error(`[voice-session:${this.sessionId}] lazy ASR start failed: ${err}`);
+        this.pcmBuffer = [];
+        this.asrStartPromise = null;
+      });
+  }
+
   /** Send PCM chunk directly to ASR — no buffering. */
   handlePcm(data: Buffer): void {
     if (this.destroyed) return;
-    if (this.asr) {
+
+    if (this.asr && this.asr.isAlive) {
       this.asr.feedPCM(data);
+    } else {
+      // ASR is null or dead (timed out) — lazily start a new one
+      this.ensureASR(data);
     }
   }
 
@@ -83,6 +124,11 @@ export class VoiceSession {
   async handleSpeechEnd(): Promise<void> {
     if (this.destroyed) return;
     if (this.state !== "idle" && this.state !== "listening") return;
+
+    // Wait for pending lazy ASR startup before proceeding
+    if (this.asrStartPromise) {
+      await this.asrStartPromise;
+    }
 
     this.processingPromise = this.runPipeline();
     await this.processingPromise;
@@ -128,6 +174,9 @@ export class VoiceSession {
 
       await this.cfg.processText(text, (chunk: string) => {
         if (this.destroyed || this.interruptSignal.aborted || !chunk.trim()) return;
+
+        // Stream AI text to client for real-time subtitles
+        this.callbacks.onAiText(chunk);
 
         if (!hasText) {
           hasText = true;
@@ -217,6 +266,7 @@ export class VoiceSession {
       this.asr.destroy();
       this.asr = null;
     }
+    this.pcmBuffer = [];
     try {
       await this.tts.disconnect();
     } catch {}

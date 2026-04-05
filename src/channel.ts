@@ -21,6 +21,7 @@ import {
 } from "./ws-bridge.js";
 import { VoiceSession } from "./voice-session.js";
 import { resolveVoiceConfig, buildTTSConfig, buildASRConfig } from "./voice-config.js";
+import { downloadImageToLocal } from "./download-image.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -276,7 +277,26 @@ async function handleInboundExecute(
   const sessionId = params.session_id || crypto.randomUUID();
   const requestId = params.request_id || crypto.randomUUID();
   const messageId = crypto.randomUUID(); // Stable message ID for this response stream
-  const instruction = params.instruction;
+
+  // Download image attachments to local disk — the SDK only reads local files (MediaPaths).
+  const imageAttachments = (params.attachments ?? []).filter((a) => (a.type ?? a.file_type) === "image");
+  const localMediaPaths: string[] = [];
+  const localMediaTypes: string[] = [];
+  for (const att of imageAttachments) {
+    if (!att.url) continue;
+    try {
+      const localPath = await downloadImageToLocal(att.url, att.file_name || att.name);
+      localMediaPaths.push(localPath);
+      localMediaTypes.push(att.mime_type || "image/jpeg");
+    } catch (err) {
+      ctx.log?.error?.(`[${CHANNEL_ID}] failed to download image: ${err}`);
+    }
+  }
+
+  let instruction = params.instruction ?? "";
+  if (!instruction) {
+    instruction = localMediaPaths.length > 0 ? "请看图片" : "[空消息]";
+  }
 
   // Resolve agent route
   const route = channelRuntime.routing.resolveAgentRoute({
@@ -325,6 +345,12 @@ async function handleInboundExecute(
     OriginatingTo: sessionId,
     CommandAuthorized: true,
     Timestamp: Date.now(),
+    ...(localMediaPaths.length > 0 ? {
+      MediaPaths: localMediaPaths,
+      MediaPath: localMediaPaths[0],
+      MediaTypes: localMediaTypes,
+      MediaType: localMediaTypes[0] || "image/jpeg",
+    } : {}),
   });
 
   // Record inbound session
@@ -452,6 +478,7 @@ async function handleVoiceStart(
   log: { info: (s: string) => void; warn: (s: string) => void; error: (s: string) => void }
 ): Promise<void> {
   const sessionId = params.session_id;
+  const chatSessionId = params.chat_session_id;
 
   // Destroy any existing session for this sessionId
   const existing = activeSessions.get(sessionId);
@@ -472,12 +499,13 @@ async function handleVoiceStart(
       asrConfig,
       ttsConfig,
       processText: async (text: string, onTextChunk: (chunk: string) => void) => {
-        await handleVoiceText(ctx, text, sessionId, onTextChunk, log);
+        await handleVoiceText(ctx, text, sessionId, onTextChunk, log, chatSessionId);
       },
     },
     {
       onStatus: (state) => bridge.sendVoiceStatus(sessionId, state),
       onTranscript: (text) => bridge.sendVoiceTranscript(sessionId, text),
+      onAiText: (chunk) => bridge.sendVoiceAiText(sessionId, chunk),
       onAudioChunk: (data) => bridge.sendVoiceAudioChunk(sessionId, data.toString("base64")),
       onAudioEnd: () => bridge.sendVoiceAudioEnd(sessionId),
       onError: (message) => bridge.sendVoiceError(sessionId, message),
@@ -507,17 +535,22 @@ async function handleVoiceText(
   instruction: string,
   sessionId: string,
   onTextChunk: (chunk: string) => void,
-  log: { info: (s: string) => void; warn: (s: string) => void; error: (s: string) => void }
+  log: { info: (s: string) => void; warn: (s: string) => void; error: (s: string) => void },
+  chatSessionId?: string
 ): Promise<void> {
   const runtime = getSuperAgentRuntime();
   const channelRuntime = ctx.channelRuntime ?? runtime.channel;
   const cfg = ctx.cfg;
 
+  // Use chat session ID for routing when available, so voice shares
+  // the same conversation context (including images) as text chat.
+  const routingPeerId = chatSessionId || sessionId;
+
   const route = channelRuntime.routing.resolveAgentRoute({
     cfg,
     channel: CHANNEL_ID,
     accountId: ctx.account.accountId,
-    peer: { kind: "user", id: sessionId },
+    peer: { kind: "user", id: routingPeerId },
   });
 
   const storePath = channelRuntime.session.resolveStorePath(undefined, {
@@ -531,7 +564,7 @@ async function handleVoiceText(
   });
   const body = channelRuntime.reply.formatAgentEnvelope({
     channel: CHANNEL_ID,
-    from: `voice:${sessionId}`,
+    from: `voice:${routingPeerId}`,
     timestamp: Date.now(),
     previousTimestamp,
     envelope: envelopeOptions,
@@ -543,17 +576,17 @@ async function handleVoiceText(
     RawBody: instruction,
     CommandBody: instruction,
     BodyForAgent: instruction,
-    From: `${CHANNEL_ID}:${sessionId}`,
+    From: `${CHANNEL_ID}:${routingPeerId}`,
     To: `${CHANNEL_ID}:${ctx.account.accountId}`,
     SessionKey: route.sessionKey,
     AccountId: ctx.account.accountId,
     ChatType: "direct",
     SenderName: `voice:${sessionId}`,
-    SenderId: sessionId,
+    SenderId: routingPeerId,
     Provider: CHANNEL_ID,
     Surface: CHANNEL_ID,
     OriginatingChannel: CHANNEL_ID,
-    OriginatingTo: sessionId,
+    OriginatingTo: routingPeerId,
     CommandAuthorized: true,
     Timestamp: Date.now(),
   });

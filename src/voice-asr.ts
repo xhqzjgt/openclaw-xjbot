@@ -107,6 +107,11 @@ export class DoubaoASR {
   private timeout: ReturnType<typeof setTimeout> | null = null;
   private onPartial?: (text: string) => void;
 
+  /** Whether the ASR session is still active and accepting PCM. */
+  get isAlive(): boolean {
+    return this.started && !this.resolved;
+  }
+
   constructor(
     private cfg: DoubaoASRConfig,
     private log?: { info: (s: string) => void; error: (s: string) => void },

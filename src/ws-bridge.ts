@@ -30,10 +30,14 @@ export interface AgentExecuteParams {
   session_id: string;
   request_id: string;
   attachments?: Array<{
-    type: "image" | "audio" | "file";
+    type?: "image" | "audio" | "file";
+    file_type?: "image" | "audio" | "file";
+    file_id?: string;
+    file_name?: string;
     url: string;
     name?: string;
     mime_type?: string;
+    size_bytes?: number;
   }>;
 }
 
@@ -130,6 +134,7 @@ export type VoiceState = "listening" | "thinking" | "speaking" | "idle";
 export interface VoiceStartParams {
   target_device_id: string;
   session_id: string;
+  chat_session_id?: string;
 }
 
 export interface VoicePcmParams {
@@ -285,6 +290,10 @@ export class WsBridge {
 
   sendVoiceAudioEnd(sessionId: string): void {
     this.sendNotification("voice.audio_end", { session_id: sessionId });
+  }
+
+  sendVoiceAiText(sessionId: string, chunk: string): void {
+    this.sendNotification("voice.ai_text", { session_id: sessionId, text: chunk });
   }
 
   sendVoiceError(sessionId: string, message: string): void {
