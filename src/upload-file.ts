@@ -1,5 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
+
+const MEDIA_OUTBOUND_DIR = path.join(os.homedir(), ".openclaw", "media", "outbound");
 
 interface AttachmentResult {
   file_id: string;
@@ -55,9 +58,16 @@ export async function uploadLocalFile(
       fileName = "image.jpg";
     }
   } else {
-    // Local file path
-    buffer = await fs.promises.readFile(filePathOrUrl);
-    fileName = path.basename(filePathOrUrl);
+    // Local file path — try the given path first, then fallback to media/outbound/
+    let resolvedPath = filePathOrUrl;
+    if (!fs.existsSync(resolvedPath)) {
+      const fallback = path.join(MEDIA_OUTBOUND_DIR, path.basename(resolvedPath));
+      if (fs.existsSync(fallback)) {
+        resolvedPath = fallback;
+      }
+    }
+    buffer = await fs.promises.readFile(resolvedPath);
+    fileName = path.basename(resolvedPath);
   }
 
   const mimeType = guessMimeType(fileName);
